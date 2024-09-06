@@ -80,7 +80,6 @@ class CrossValidationPipeline:
         self.model_name = cmd_args.model_name
         self.clip_grads = str(cmd_args.clip_grads).lower() == "true"
         self.with_apex = str(cmd_args.apex).lower() == "true"
-        self.init_thresh = cmd_args.init_thresh
         self.with_mip = str(cmd_args.with_mip).lower() == "true"
         self.num_classes = cmd_args.num_classes
         self.train_encoder_only = cmd_args.train_encoder_only
@@ -124,6 +123,14 @@ class CrossValidationPipeline:
         # self.focalTverskyLoss = FocalTverskyLoss()
         # self.iou = IOU()
 
+        # Morphological hyper-parameters
+        self.init_threshold = cmd_args.init_threshold
+        self.otsu_thresh_param = cmd_args.otsu_thresh_param
+        self.area_opening_threshold = cmd_args.area_opening_threshold
+        self.footprint_radius = cmd_args.footprint_radius
+
+        self.save_img = str(cmd_args).lower() == "true"
+
         self.LOWEST_LOSS = float('inf')
 
         self.scaler = GradScaler()
@@ -154,6 +161,23 @@ class CrossValidationPipeline:
     def create_tio_sub_ds(patch_size, dir_path, stride_length, stride_width, stride_depth,
                           logger, output_path, model_name, is_validate=False,
                           get_subjects_only=False, label_dir_path=None, validation_set=None, threshold=3):
+        """
+        Purpose: Creates 3D patches from 3D volumes using torchio and SRDataset
+        :param dir_path: Path to 3D MRA volumes
+        :param logger: File logger
+        :param patch_size: Individual patch dimension(Only patches of equal length, width and depth are created)
+        :param stride_depth: Stride Depth for patch creation
+        :param stride_length: Stride Length for patch creation
+        :param stride_width: Stride Width for patch creation
+        :param output_path: Path to log and save thresholded images
+        :param model_name: Name of the current model
+        :param is_validate: Set this to true to create a tio.queue of 3D patches for validation
+        :param label_dir_path: Path to GT. If provided, the MIP of the GT is computed along the 3 perceivable axes
+        and the corresponding patch on the MIP of the 3D volume is returned on each lazy load of the 3D patch.
+        :param threshold: The percentage threshold for initial histogram-based thresholding.
+        :param validation_set: Use this to specify validation set externally
+        :param get_subjects_only: If set, returns subjects array with 4D volumes array(channel x width x depth x height)
+        """
         if is_validate:
             validation_ds = SRDataset(logger=logger, patch_size=patch_size,
                                       dir_path=dir_path,
@@ -209,12 +233,16 @@ class CrossValidationPipeline:
 
     @staticmethod
     def normaliser(batch):
+        """
+        Purpose: Normalise pixel intensities by comparing max values in the 3D patch
+        :param batch: 5D array (batch_size x channel x width x depth x height)
+        """
         for i in range(batch.shape[0]):
             if batch[i].max() > 0.0:
                 batch[i] = batch[i] / batch[i].max()
         return batch
 
-    def load(self, checkpoint_path=None, load_best=True, fold_index=""):
+    def load(self, checkpoint_path=None, load_best=True, checkpoint_filename="", fold_index=""):
         """
         Purpose: Continue training from previous checkpoint or load an existing checkpoint for testing
         :param checkpoint_path: Path to the saved network state dictionary. If not specified, the path to checkpoint
@@ -225,14 +253,18 @@ class CrossValidationPipeline:
         if checkpoint_path is None:
             checkpoint_path = self.CHECKPOINT_PATH
 
+        if checkpoint_filename == "":
+            checkpoint_filename = "checkpoint"
+
         if self.with_apex:
             self.model, self.optimizer, self.scaler = load_model_with_amp(self.model, self.optimizer, checkpoint_path,
                                                                           batch_index="best" if load_best else "last",
-                                                                          fold_index=fold_index)
+                                                                          fold_index=fold_index,
+                                                                          filename=checkpoint_filename)
         else:
             self.model, self.optimizer = load_model(self.model, self.optimizer, checkpoint_path,
                                                     batch_index="best" if load_best else "last",
-                                                    fold_index=fold_index)
+                                                    fold_index=fold_index, filename=checkpoint_filename)
 
     def reset(self):
         """
@@ -281,7 +313,7 @@ class CrossValidationPipeline:
                                      stride_width=self.stride_width, fly_under_percent=None,
                                      patch_size_us=self.patch_size, pre_interpolate=None, norm_data=False,
                                      pre_load=True,
-                                     return_coords=True, files_us=train_vols, threshold=self.init_thresh)
+                                     return_coords=True, files_us=train_vols, threshold=self.init_threshold)
             sampler = torch.utils.data.RandomSampler(data_source=training_set, replacement=True,
                                                      num_samples=self.samples_per_epoch)
             train_loader = torch.utils.data.DataLoader(training_set, batch_size=self.batch_size,
@@ -297,7 +329,7 @@ class CrossValidationPipeline:
                                                                        stride_depth=self.stride_depth,
                                                                        logger=self.logger, is_validate=True,
                                                                        validation_set=validation_vols,
-                                                                       threshold=self.init_thresh)
+                                                                       threshold=self.init_threshold)
             sampler = torch.utils.data.RandomSampler(data_source=validation_set, replacement=True,
                                                      num_samples=self.samples_per_epoch)
             validate_loader = torch.utils.data.DataLoader(validation_set, batch_size=self.batch_size,
@@ -621,71 +653,124 @@ class CrossValidationPipeline:
                     'optimizer': self.optimizer.state_dict(),
                     'amp': None}, fold_index=fold_index)
 
-    def test(self, test_logger, test_subjects=None, save_results=True, fold_index=""):
+    def test(self, test_logger, test_subjects=None, save_results=True):
+        """
+        Purpose: Performs Generalization Performance Testing of the given model along with
+        inference prediction on specified 3D MRA volume.
+        :param test_logger: File logger
+        :param save_results: If set, saves resulting segmentation as .nii.gz, the color MIP overlay of comparison of
+        segmentation prediction against the ground truth.
+        :param test_subjects: If specified, uses the given array of subjects(torchio subjects array) to
+        prepare test loader. Otherwise creates test subjects from '/test/' and '/test_label/' folders.
+        """
         test_logger.debug('Testing...')
         self.model.eval()
         result_root = os.path.join(self.OUTPUT_PATH, self.model_name, "results")
         os.makedirs(result_root, exist_ok=True)
-        test_subject = test_subjects[0]
-        subjectname = test_subject['subjectname']
-        overlap = np.subtract(self.patch_size, (self.stride_length, self.stride_width, self.stride_depth))
-        grid_sampler = tio.inference.GridSampler(
-            test_subject,
-            self.patch_size,
-            overlap,
-        )
+        dir_path = self.DATASET_PATH + "/test/"
+        if test_subjects is None:
+            vols = glob(dir_path + "*.nii") + glob(dir_path + "*.nii.gz")
+            subjects = []
+            for i in range(len(vols)):
+                v = vols[i]
+                filename = os.path.basename(v).split('.')[0]
+                # Apply same initial thresholding as the pre-trained model
+                img_data = tio.ScalarImage(v)
+                img_data.data = img_data.data.type(torch.float64)
+                # img_data.data = torch.where((img_data.data) < 135.0, 0.0, img_data.data)
+                temp_data = img_data.data.numpy().astype(np.float64)
+                bins = torch.arange(temp_data.min(), temp_data.max() + 2, dtype=torch.float64)
+                histogram, bin_edges = np.histogram(temp_data, int(temp_data.max() + 2))
+                init_threshold = bin_edges[int(len(bins) - (1 - (self.init_threshold * 0.01)) * len(bins))]
+                img_data.data = torch.where((img_data.data) <= init_threshold, 0.0, img_data.data)
 
-        aggregator1 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
-        aggregator2 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
-        patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=self.batch_size, shuffle=False,
-                                                   num_workers=self.num_worker)
+                sub_dict = {
+                    "img": img_data,
+                    "subjectname": filename,
+                    # "sampling_map": tio.Image(image_path.split('.')[0] + '_mask.nii.gz', type=tio.SAMPLING_MAP)
+                }
+                subject = tio.Subject(**sub_dict)
+                subjects.append(subject)
 
-        for index, patches_batch in enumerate(tqdm(patch_loader)):
-            local_batch = CrossValidationPipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
-            locations = patches_batch[tio.LOCATION]
+        for test_subject in test_subjects:
+            # test_subject = test_subjects[0]
+            subjectname = test_subject['subjectname']
+            overlap = np.subtract(self.patch_size, (self.stride_length, self.stride_width, self.stride_depth))
+            grid_sampler = tio.inference.GridSampler(
+                test_subject,
+                self.patch_size,
+                overlap,
+            )
 
-            with autocast(enabled=self.with_apex):
-                class_preds, feature_rep = self.model(local_batch, ops="enc")
-                feature_rep = torch.sigmoid(feature_rep)
-                # reconstructed_patch = torch.sigmoid(reconstructed_patch)
-                ignore, class_assignments = torch.max(class_preds, 1, keepdim=True)
-                class_preds = class_preds.detach().type(local_batch.type())
-                # reconstructed_patch = reconstructed_patch.detach().type(local_batch.type())
-                ignore = ignore.detach()
-                class_assignments = class_assignments.detach().type(local_batch.type())
-                feature_rep = feature_rep.detach().type(local_batch.type())
-            # aggregator1.add_batch(class_preds, locations)
-            aggregator1.add_batch(feature_rep, locations)
-            aggregator2.add_batch(class_assignments, locations)
+            aggregator1 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
+            aggregator2 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
+            patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=self.batch_size, shuffle=False,
+                                                       num_workers=self.num_worker)
+            # Extract volumetric segmentation prediction by combining overlapping 3D patch inferences
+            for index, patches_batch in enumerate(tqdm(patch_loader)):
+                local_batch = CrossValidationPipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
+                locations = patches_batch[tio.LOCATION]
 
-        class_probs = aggregator1.get_output_tensor()
-        class_assignments = aggregator2.get_output_tensor()
+                with autocast(enabled=self.with_apex):
+                    class_preds, feature_rep = self.model(local_batch, ops="enc")
+                    feature_rep = torch.sigmoid(feature_rep)
+                    # reconstructed_patch = torch.sigmoid(reconstructed_patch)
+                    ignore, class_assignments = torch.max(class_preds, 1, keepdim=True)
+                    class_preds = class_preds.detach().type(local_batch.type())
+                    # reconstructed_patch = reconstructed_patch.detach().type(local_batch.type())
+                    ignore = ignore.detach()
+                    class_assignments = class_assignments.detach().type(local_batch.type())
+                    feature_rep = feature_rep.detach().type(local_batch.type())
+                # aggregator1.add_batch(class_preds, locations)
+                aggregator1.add_batch(feature_rep, locations)
+                aggregator2.add_batch(class_assignments, locations)
 
-        # to avoid memory errors
-        torch.cuda.empty_cache()
+            class_probs = aggregator1.get_output_tensor()
+            class_assignments = aggregator2.get_output_tensor()
 
-        torch.save(class_probs, os.path.join(result_root, subjectname + "_fold_" + fold_index + "_class_probs.pth"))
-        torch.save(class_assignments,
-                   os.path.join(result_root, subjectname + "_fold_" + fold_index + "_class_assignments.pth"))
+            # to avoid memory errors
+            torch.cuda.empty_cache()
 
-        class_probs = class_probs.squeeze().numpy()
-        thresh = threshold_otsu(class_probs)
-        class_probs = class_probs < thresh
-        footprint = ball(1)
-        class_probs = area_opening(class_probs, area_threshold=32)
-        class_probs = dilation(class_probs, footprint)
-        save_nifti(class_probs.astype("uint16"), os.path.join(result_root, subjectname + "_fold_" + fold_index + ".nii.gz"))
+            # Segmentation post-processing
+            # 1. Apply otsu-threshold
+            thresh = threshold_otsu(class_probs.squeeze().numpy())
+            class_probs = class_probs < (thresh * self.otsu_thresh_param)
+
+            # 2. Apply morphological area-opening
+            opened = area_opening(class_probs.squeeze().numpy().astype(np.uint16),
+                                  area_threshold=self.area_opening_threshold)
+
+            # 3. Apply morphological dilation
+            footprint = ball(self.footprint_radius)
+            dilated = dilation(opened, footprint)
+
+            save_nifti(dilated, os.path.join(result_root, subjectname + ".nii.gz"))
+
+            # torch.save(class_probs, os.path.join(result_root, subjectname + "_class_probs.pth"))
+            # torch.save(class_assignments, os.path.join(result_root, subjectname + "_class_assignments.pth"))
+
+            # save_nifti(class_probs.squeeze().numpy().astype(np.float32),
+            #            os.path.join(result_root, subjectname + "_seg_vol.nii.gz"))
+            # save_nifti(reconstructed_image.squeeze().numpy().astype(np.float32),
+            #            os.path.join(result_root, subjectname + "_recr.nii.gz"))
 
     def predict(self, image_path, label_path, predict_logger, fold_index=""):
+        """
+        Purpose: Render inference on nifti 3D volume specified using pretrained WNet network
+        :param image_path: Path to the nifti nii image
+        :param label_path: Optionally provide the GT path
+        :param predict_logger: To log exceptions
+        """
         image_name = os.path.basename(image_path).split('.')[0]
+        # Apply same initial thresholding as the pre-trained model
         img_data = tio.ScalarImage(image_path)
         img_data.data = img_data.data.type(torch.float64)
         # img_data.data = torch.where((img_data.data) < 135.0, 0.0, img_data.data)
         temp_data = img_data.data.numpy().astype(np.float64)
         bins = torch.arange(temp_data.min(), temp_data.max() + 2, dtype=torch.float64)
         histogram, bin_edges = np.histogram(temp_data, int(temp_data.max() + 2))
-        init_threshold = bin_edges[int(len(bins) - (1 - (self.init_thresh * 0.01)) * len(bins))]
-        img_data.data = torch.where((img_data.data) <= init_threshold, 0.0, img_data.data)
+        init_threshold = bin_edges[int(len(bins) - (1 - (self.init_threshold * 0.01)) * len(bins))]
+        img_data.data = torch.where(img_data.data <= init_threshold, 0.0, img_data.data)
 
         sub_dict = {
             "img": img_data,
@@ -698,4 +783,4 @@ class CrossValidationPipeline:
 
         subject = tio.Subject(**sub_dict)
 
-        self.test(predict_logger, test_subjects=[subject], save_results=True, fold_index=fold_index)
+        self.test(predict_logger, test_subjects=[subject], save_results=True)

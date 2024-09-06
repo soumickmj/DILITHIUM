@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 
-Purpose :
+Purpose : File logger for the implementation
 
 """
 

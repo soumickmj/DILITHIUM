@@ -1,4 +1,8 @@
-# from __future__ import self.logger.debug_function, division
+"""
+Purpose: Adaptation of original implementation to create 3D patches from 3D volumes and
+return 3D patch, corresponding 3D label patch and corresponding 2D patch on the MIP of the 3D label.
+Additionally, MIP(s) are computed along all 3 perceivable axes(x, y and z).
+"""
 
 
 import glob
@@ -39,6 +43,29 @@ class SRDataset(Dataset):
                  stride_width=32,
                  label_dir_path=None, size=None, fly_under_percent=None, patch_size_us=None, return_coords=False,
                  pad_patch=True, pre_interpolate=None, norm_data=True, pre_load=False, files_us=None, threshold=3):
+        """
+        Purpose: Create 3D patches from input 3D volume paths and their label paths along with
+        an option to return co-ordinate based metadata.
+        :param logger: File logger
+        :param patch_size: Individual patch dimension
+        (Currently only patches of equal width, depth and length are created)
+        :param dir_path: Path to directory containing 3D MRA volumes in .nii or .nii.gz format
+        :param label_dir_path: Path to directory containing 3D Ground Truth Segmentations in .nii or .nii.gz format
+        :param stride_depth: Stride Depth for patch creation
+        :param stride_length: Stride Length for patch creation
+        :param stride_width: Stride Width for patch creation
+        :param size: Set this to return a sampled subset of the dataset of 3D patches
+        :param fly_under_percent: WIP
+        :param patch_size_us: Specify if label patch_size is intended to be different than input patch_size
+        :param return_coords: If set, returns 3D patch, corresponding label patch,
+        2D patch on MIP of the 3D label and patch co-ordinates. Otherwise returns 3D patch and corresponding label patch
+        :param pad_patch: If set, adds padding to patches of odd shape resulting from strides to make them equal sized.
+        Otherwise returns odd shaped patches along with other equal sized patches.
+        :param pre_interpolate: Interpolates patches if set
+        :param norm_data: Performs pixel intensity normalisation if set
+        :param pre_load: If set, keeps 3D volumes in memory and reuses them on load to create patches
+        :param files_us: Array of absolute paths to input 3D volumes. Must be specified for specific fold of CV.
+        """
         self.label_dir_path = label_dir_path
         self.patch_size = patch_size
         self.stride_depth = stride_depth
@@ -126,7 +153,7 @@ class SRDataset(Dataset):
                 img_data = image_file.data.numpy().astype(np.float64)
                 bins = torch.arange(img_data.min(), img_data.max() + 2, dtype=torch.float64)
                 histogram, bin_edges = np.histogram(img_data, int(img_data.max() + 2))
-                init_threshold = bin_edges[int(len(bins) - (1-(threshold*0.01)) * len(bins))]
+                init_threshold = bin_edges[int(len(bins) - (1 - (threshold * 0.01)) * len(bins))]
                 img_data = torch.from_numpy(img_data).type(torch.float64)
                 img_data = torch.where((img_data <= init_threshold), 0.0, img_data)
                 save_nifti(img_data.squeeze().numpy().astype(np.float32),

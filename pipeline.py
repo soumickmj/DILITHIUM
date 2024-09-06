@@ -1,24 +1,32 @@
 # !/usr/bin/env python
 """
-
+Purpose: 3D unsupervised and weakly-supervised patch-based vessel segmentation pipeline implementation.
+Features:
+* Baseline WNet training and testing
+* Training unsupervised Att. WNet, weakly-supervised Att. WNet with MIP (single and multi-axial) loss.
+* Training unsupervised MSS WNet, weakly-supervised MSS WNet with MIP (single and multi-axial) loss.
+* Extracting inference and post-processing of the predicted segmentation
 """
 
 import torch
 import torch.utils.data
 import torchio as tio
-from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
 # from PIL import Image
 # from torchviz import make_dot
+from skimage.filters import threshold_otsu
+from skimage.morphology import area_opening, ball, dilation
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+import sys
 
 from evaluation.metrics import (SoftNCutsLoss, ReconstructionLoss, l2_regularisation_loss, FocalTverskyLoss)
+from utils.datasets import SRDataset
+from utils.madam import Madam
+from utils.mtadam import MTAdam
 # from torchmetrics.functional import structural_similarity_index_measure
 # from pytorch_msssim import ssim
 from utils.results_analyser import *
 from utils.vessel_utils import (load_model, load_model_with_amp, save_model, write_epoch_summary)
-from utils.madam import Madam
-from utils.mtadam import MTAdam
-from utils.datasets import SRDataset
 
 __author__ = "Chethan Radhakrishna and Soumick Chatterjee"
 __credits__ = ["Chethan Radhakrishna", "Soumick Chatterjee"]
@@ -33,7 +41,17 @@ class Pipeline:
 
     def __init__(self, cmd_args, model, logger, dir_path, checkpoint_path, writer_training, writer_validating,
                  wandb=None):
-
+        """
+        :param cmd_args: command line arguments for initializing network parameters, experimental hyper-parameters and
+        environmental parameters
+        :param model: initialized baseline network i.e., 1: UNet, 2: UNet-MSS, 3: Attention UNet
+        :param logger: File logger
+        :param dir_path: Dataset Folder location
+        :param checkpoint_path: Path to saved model state dictionary
+        :param writer_training: Initialized train writer
+        :param writer_validating: Initialized validation writer
+        :param wandb: Initialized 'Weights and Biases' configuration for logging
+        """
         self.model = model
         self.logger = logger
         self.learning_rate = cmd_args.learning_rate
@@ -100,6 +118,14 @@ class Pipeline:
         # self.focalTverskyLoss = FocalTverskyLoss()
         # self.iou = IOU()
 
+        # Morphological hyper-parameters
+        self.init_threshold = cmd_args.init_threshold
+        self.otsu_thresh_param = cmd_args.otsu_thresh_param
+        self.area_opening_threshold = cmd_args.area_opening_threshold
+        self.footprint_radius = cmd_args.footprint_radius
+
+        self.save_img = str(cmd_args).lower() == "true"
+
         self.LOWEST_LOSS = float('inf')
 
         self.scaler = GradScaler()
@@ -124,7 +150,8 @@ class Pipeline:
                                      stride_width=self.stride_width, fly_under_percent=None,
                                      patch_size_us=self.patch_size, pre_interpolate=None, norm_data=False,
                                      pre_load=True,
-                                     return_coords=True)
+                                     return_coords=True,
+                                     threshold=self.init_threshold)
             sampler = torch.utils.data.RandomSampler(data_source=training_set, replacement=True,
                                                      num_samples=self.samples_per_epoch)
             self.train_loader = torch.utils.data.DataLoader(training_set, batch_size=self.batch_size,
@@ -138,7 +165,8 @@ class Pipeline:
                                                         stride_length=self.stride_length,
                                                         stride_width=self.stride_width,
                                                         stride_depth=self.stride_depth,
-                                                        logger=self.logger, is_validate=True)
+                                                        logger=self.logger, is_validate=True,
+                                                        init_threshold=self.init_threshold)
             sampler = torch.utils.data.RandomSampler(data_source=validation_set, replacement=True,
                                                      num_samples=self.samples_per_epoch)
             self.validate_loader = torch.utils.data.DataLoader(validation_set, batch_size=self.batch_size,
@@ -148,7 +176,23 @@ class Pipeline:
     @staticmethod
     def create_tio_sub_ds(patch_size, dir_path, stride_length, stride_width, stride_depth,
                           logger, output_path, model_name, is_validate=False,
-                          get_subjects_only=False, label_dir_path=None):
+                          get_subjects_only=False, label_dir_path=None, init_threshold=3):
+        """
+        Purpose: Creates 3D patches from 3D volumes using torchio and SRDataset
+        :param dir_path: Path to 3D MRA volumes
+        :param logger: File logger
+        :param patch_size: Individual patch dimension(Only patches of equal length, width and depth are created)
+        :param stride_depth: Stride Depth for patch creation
+        :param stride_length: Stride Length for patch creation
+        :param stride_width: Stride Width for patch creation
+        :param output_path: Path to log and save thresholded images
+        :param model_name: Name of the current model
+        :param is_validate: Set this to true to create a tio.queue of 3D patches for validation
+        :param label_dir_path: Path to GT. If provided, the MIP of the GT is computed along the 3 perceivable axes
+        and the corresponding patch on the MIP of the 3D volume is returned on each lazy load of the 3D patch.
+        :param init_threshold: The percentage threshold for initial histogram-based thresholding.
+        :param get_subjects_only: If set, returns subjects array with 4D volumes array(channel x width x depth x height)
+        """
         if is_validate:
             validation_ds = SRDataset(logger=logger, patch_size=patch_size,
                                       dir_path=dir_path,
@@ -159,7 +203,7 @@ class Pipeline:
                                       stride_width=stride_width, fly_under_percent=None,
                                       patch_size_us=patch_size, pre_interpolate=None, norm_data=False,
                                       pre_load=True,
-                                      return_coords=True)
+                                      return_coords=True, threshold=init_threshold)
             overlap = np.subtract(patch_size, (stride_length, stride_width, stride_depth))
             grid_samplers = []
             for i in range(len(validation_ds)):
@@ -204,29 +248,50 @@ class Pipeline:
 
     @staticmethod
     def normaliser(batch):
+        """
+        Purpose: Normalise pixel intensities by comparing max values in the 3D patch
+        :param batch: 5D array (batch_size x channel x width x depth x height)
+        """
         for i in range(batch.shape[0]):
             if batch[i].max() > 0.0:
                 batch[i] = batch[i] / batch[i].max()
         return batch
 
-    def load(self, checkpoint_path=None, load_best=True):
+    def load(self, checkpoint_path=None, load_best=True, checkpoint_filename="", fold_index=""):
+        """
+        Purpose: Continue training from previous checkpoint or load an existing checkpoint for testing
+        :param checkpoint_path: Path to the saved network state dictionary. If not specified, the path to checkpoint
+        location of current directory is used.
+        :param load_best: If set, uses best checkpoint from the checkpoint location. Otherwise uses last checkpoint.
+        :param fold_index: Current fold number. Do not specify if debugging a specific fold.
+        """
         if checkpoint_path is None:
             checkpoint_path = self.CHECKPOINT_PATH
 
+        if checkpoint_filename == "":
+            checkpoint_filename = "checkpoint"
+
         if self.with_apex:
             self.model, self.optimizer, self.scaler = load_model_with_amp(self.model, self.optimizer, checkpoint_path,
-                                                                          batch_index="best" if load_best else "last")
+                                                                          batch_index="best" if load_best else "last",
+                                                                          fold_index=fold_index,
+                                                                          filename=checkpoint_filename)
         else:
             self.model, self.optimizer = load_model(self.model, self.optimizer, checkpoint_path,
-                                                    batch_index="best" if load_best else "last")
+                                                    batch_index="best" if load_best else "last",
+                                                    fold_index=fold_index, filename=checkpoint_filename)
 
     def train(self):
+        """
+        Purpose: Training Pipeline including Leave-One-Out Validation.
+        Performs a variety of trainings specified by command line parameters.
+        """
         self.logger.debug("Training...")
 
         training_batch_index = 0
         for epoch in range(self.num_epochs):
             print("Train Epoch: " + str(epoch) + " of " + str(self.num_epochs))
-            self.model.train()
+            self.model.train()  # make sure to assign mode:train, because in validation, mode is assigned as eval
             total_soft_ncut_loss = 0
             total_reconstr_loss = 0
             total_mip_loss = 0
@@ -513,94 +578,124 @@ class Pipeline:
                     'optimizer': self.optimizer.state_dict(),
                     'amp': None})
 
-    def test_dummy(self, test_logger, test_subjects=None, save_results=True):
-        test_logger.debug('Testing...')
-        result_root = os.path.join(self.OUTPUT_PATH, self.model_name, "results")
-        os.makedirs(result_root, exist_ok=True)
-
-        self.model.eval()
-
-        with torch.no_grad():
-            test_subject = test_subjects[0]
-            subjectname = test_subject['subjectname']
-            ip_vol = test_subject['img'][tio.DATA].float().cuda()
-            ip_vol = torch.reshape(ip_vol[:, :, :, :144], (1, 1, 240, 240, 144))
-            print("ip_vol shape: {}".format(ip_vol.shape))
-            with autocast(enabled=self.with_apex):
-                class_preds, reconstructed_patch = self.model(ip_vol, ops="both")
-                reconstructed_patch = torch.sigmoid(reconstructed_patch)
-                print("class_preds shape: {}".format(class_preds.shape))
-                print("reconstructed_patch shape: {}".format(reconstructed_patch.shape))
-                torch.save(class_preds, os.path.join(result_root, subjectname + "_class_preds.pth"))
-                torch.save(reconstructed_patch, os.path.join(result_root, subjectname + "_recr.pth"))
-                ignore, class_assignments = torch.max(class_preds, 1)
-                print("class_assignments shape: {}".format(class_assignments.shape))
-                class_assignments = class_assignments.cpu().squeeze().numpy().astype(np.float32)
-                reconstructed_patch = reconstructed_patch.cpu().squeeze().numpy().astype(np.float32)
-                save_nifti(class_assignments, os.path.join(result_root, subjectname + "_seg_vol.nii.gz"))
-                save_nifti(reconstructed_patch, os.path.join(result_root, subjectname + "_recr.nii.gz"))
-
     def test(self, test_logger, test_subjects=None, save_results=True):
+        """
+        Purpose: Performs Generalization Performance Testing of the given model along with
+        inference prediction on specified 3D MRA volume.
+        :param test_logger: File logger
+        :param save_results: If set, saves resulting segmentation as .nii.gz, the color MIP overlay of comparison of
+        segmentation prediction against the ground truth.
+        :param test_subjects: If specified, uses the given array of subjects(torchio subjects array) to
+        prepare test loader. Otherwise creates test subjects from '/test/' and '/test_label/' folders.
+        """
         test_logger.debug('Testing...')
         self.model.eval()
         result_root = os.path.join(self.OUTPUT_PATH, self.model_name, "results")
         os.makedirs(result_root, exist_ok=True)
-        test_subject = test_subjects[0]
-        subjectname = test_subject['subjectname']
-        overlap = np.subtract(self.patch_size, (self.stride_length, self.stride_width, self.stride_depth))
-        grid_sampler = tio.inference.GridSampler(
-            test_subject,
-            self.patch_size,
-            overlap,
-        )
+        dir_path = self.DATASET_PATH + "/test/"
+        if test_subjects is None:
+            vols = glob(dir_path + "*.nii") + glob(dir_path + "*.nii.gz")
+            subjects = []
+            for i in range(len(vols)):
+                v = vols[i]
+                filename = os.path.basename(v).split('.')[0]
+                # Apply same initial thresholding as the pre-trained model
+                img_data = tio.ScalarImage(v)
+                img_data.data = img_data.data.type(torch.float64)
+                # img_data.data = torch.where((img_data.data) < 135.0, 0.0, img_data.data)
+                temp_data = img_data.data.numpy().astype(np.float64)
+                bins = torch.arange(temp_data.min(), temp_data.max() + 2, dtype=torch.float64)
+                histogram, bin_edges = np.histogram(temp_data, int(temp_data.max() + 2))
+                init_threshold = bin_edges[int(len(bins) - (1 - (self.init_threshold * 0.01)) * len(bins))]
+                img_data.data = torch.where((img_data.data) <= init_threshold, 0.0, img_data.data)
 
-        aggregator1 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
-        aggregator2 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
-        patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=self.batch_size, shuffle=False,
-                                                   num_workers=self.num_worker)
+                sub_dict = {
+                    "img": img_data,
+                    "subjectname": filename,
+                    # "sampling_map": tio.Image(image_path.split('.')[0] + '_mask.nii.gz', type=tio.SAMPLING_MAP)
+                }
+                subject = tio.Subject(**sub_dict)
+                subjects.append(subject)
 
-        for index, patches_batch in enumerate(tqdm(patch_loader)):
-            local_batch = Pipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
-            locations = patches_batch[tio.LOCATION]
+        for test_subject in test_subjects:
+            # test_subject = test_subjects[0]
+            subjectname = test_subject['subjectname']
+            overlap = np.subtract(self.patch_size, (self.stride_length, self.stride_width, self.stride_depth))
+            grid_sampler = tio.inference.GridSampler(
+                test_subject,
+                self.patch_size,
+                overlap,
+            )
 
-            with autocast(enabled=self.with_apex):
-                class_preds, feature_rep = self.model(local_batch, ops="enc")
-                feature_rep = torch.sigmoid(feature_rep)
-                # reconstructed_patch = torch.sigmoid(reconstructed_patch)
-                ignore, class_assignments = torch.max(class_preds, 1, keepdim=True)
-                class_preds = class_preds.detach().type(local_batch.type())
-                # reconstructed_patch = reconstructed_patch.detach().type(local_batch.type())
-                ignore = ignore.detach()
-                class_assignments = class_assignments.detach().type(local_batch.type())
-                feature_rep = feature_rep.detach().type(local_batch.type())
-            # aggregator1.add_batch(class_preds, locations)
-            aggregator1.add_batch(feature_rep, locations)
-            aggregator2.add_batch(class_assignments, locations)
+            aggregator1 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
+            aggregator2 = tio.inference.GridAggregator(grid_sampler, overlap_mode="average")
+            patch_loader = torch.utils.data.DataLoader(grid_sampler, batch_size=self.batch_size, shuffle=False,
+                                                       num_workers=self.num_worker)
+            # Extract volumetric segmentation prediction by combining overlapping 3D patch inferences
+            for index, patches_batch in enumerate(tqdm(patch_loader)):
+                local_batch = Pipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
+                locations = patches_batch[tio.LOCATION]
 
-        class_probs = aggregator1.get_output_tensor()
-        class_assignments = aggregator2.get_output_tensor()
+                with autocast(enabled=self.with_apex):
+                    class_preds, feature_rep = self.model(local_batch, ops="enc")
+                    feature_rep = torch.sigmoid(feature_rep)
+                    # reconstructed_patch = torch.sigmoid(reconstructed_patch)
+                    ignore, class_assignments = torch.max(class_preds, 1, keepdim=True)
+                    class_preds = class_preds.detach().type(local_batch.type())
+                    # reconstructed_patch = reconstructed_patch.detach().type(local_batch.type())
+                    ignore = ignore.detach()
+                    class_assignments = class_assignments.detach().type(local_batch.type())
+                    feature_rep = feature_rep.detach().type(local_batch.type())
+                # aggregator1.add_batch(class_preds, locations)
+                aggregator1.add_batch(feature_rep, locations)
+                aggregator2.add_batch(class_assignments, locations)
 
-        # to avoid memory errors
-        torch.cuda.empty_cache()
+            class_probs = aggregator1.get_output_tensor()
+            class_assignments = aggregator2.get_output_tensor()
 
-        torch.save(class_probs, os.path.join(result_root, subjectname + "_class_probs.pth"))
-        torch.save(class_assignments, os.path.join(result_root, subjectname + "_class_assignments.pth"))
+            # to avoid memory errors
+            torch.cuda.empty_cache()
 
-        # save_nifti(class_probs.squeeze().numpy().astype(np.float32),
-        #            os.path.join(result_root, subjectname + "_seg_vol.nii.gz"))
-        # save_nifti(reconstructed_image.squeeze().numpy().astype(np.float32),
-        #            os.path.join(result_root, subjectname + "_recr.nii.gz"))
+            # Segmentation post-processing
+            # 1. Apply otsu-threshold
+            thresh = threshold_otsu(class_probs.squeeze().numpy())
+            class_probs = class_probs < (thresh * self.otsu_thresh_param)
 
-    def predict(self, image_path, label_path, predict_logger):
+            # 2. Apply morphological area-opening
+            opened = area_opening(class_probs.squeeze().numpy().astype(np.uint16),
+                                  area_threshold=self.area_opening_threshold)
+
+            # 3. Apply morphological dilation
+            footprint = ball(self.footprint_radius)
+            dilated = dilation(opened, footprint)
+
+            save_nifti(dilated, os.path.join(result_root, subjectname + ".nii.gz"))
+
+            # torch.save(class_probs, os.path.join(result_root, subjectname + "_class_probs.pth"))
+            # torch.save(class_assignments, os.path.join(result_root, subjectname + "_class_assignments.pth"))
+
+            # save_nifti(class_probs.squeeze().numpy().astype(np.float32),
+            #            os.path.join(result_root, subjectname + "_seg_vol.nii.gz"))
+            # save_nifti(reconstructed_image.squeeze().numpy().astype(np.float32),
+            #            os.path.join(result_root, subjectname + "_recr.nii.gz"))
+
+    def predict(self, image_path, label_path, predict_logger, fold_index=""):
+        """
+        Purpose: Render inference on nifti 3D volume specified using pretrained WNet network
+        :param image_path: Path to the nifti nii image
+        :param label_path: Optionally provide the GT path
+        :param predict_logger: To log exceptions
+        """
         image_name = os.path.basename(image_path).split('.')[0]
+        # Apply same initial thresholding as the pre-trained model
         img_data = tio.ScalarImage(image_path)
         img_data.data = img_data.data.type(torch.float64)
         # img_data.data = torch.where((img_data.data) < 135.0, 0.0, img_data.data)
         temp_data = img_data.data.numpy().astype(np.float64)
         bins = torch.arange(temp_data.min(), temp_data.max() + 2, dtype=torch.float64)
         histogram, bin_edges = np.histogram(temp_data, int(temp_data.max() + 2))
-        init_threshold = bin_edges[int(len(bins) - 0.97 * len(bins))]
-        img_data.data = torch.where((img_data.data) <= init_threshold, 0.0, img_data.data)
+        init_threshold = bin_edges[int(len(bins) - (1 - (self.init_threshold * 0.01)) * len(bins))]
+        img_data.data = torch.where(img_data.data <= init_threshold, 0.0, img_data.data)
 
         sub_dict = {
             "img": img_data,
@@ -615,68 +710,35 @@ class Pipeline:
 
         self.test(predict_logger, test_subjects=[subject], save_results=True)
 
-    @staticmethod
-    def extract_segmentation(self):
-        print("Analysing predictions...")
-        # result_root = os.path.join(self.OUTPUT_PATH, self.model_name, "results")
-        # ignore, class_preds_max = torch.max(class_preds, 0)
-        # class_preds_normalised = class_preds_max.numpy().astype(np.uint16)
-        # save_nifti(class_preds_normalised,os.path.join(result_root, self.predictor_subject_name + "_WNET_seg.nii.gz"))
+    def create_vessel_diameter_mask(self, seg_path, gt_path, dim=2):
+        """
+        Purpose: Creates a vessel diameter mask for the given predicted segmentation
+        by overlaying vessel diameters from the corresponding GT.
+        :param seg_path: Path to the predicted segmentation
+        :param gt_path: Path to the GT
+        :param dim: The number of dimensions for analysis of vessel diameter. Use 2 for 2D and 3 for 3D.
+        """
+        result_root = os.path.join(self.OUTPUT_PATH, self.model_name, "results")
+        os.makedirs(result_root, exist_ok=True)
+        subject_name = seg_path.replace("\\", "/").split("/")[-1].split(".")[0]
+        pred_seg = nib.load(seg_path).get_fdata().astype(np.uint8)
+        gt_seg = nib.load(gt_path).get_fdata().astype(np.uint8)
+        if dim == 2:
+            pred_diameter_mask = calculate_vessel_diameter2d(pred_seg)
+            gt_diameter_mask = calculate_vessel_diameter2d(gt_seg)
+        elif dim == 3:
+            pred_diameter_mask = calculate_vessel_diameter3d(pred_seg)
+            gt_diameter_mask = calculate_vessel_diameter3d(gt_seg)
+        else:
+            print("input dimensionality error")
+            sys.exit()
+        dice_df = diameter_mask_ranking(pred_diameter_mask, gt_diameter_mask, result_root, subject_name,
+                                        dim)
+        if self.save_img:
+            save_mask(mask=pred_diameter_mask, output_path=result_root,
+                      op_filename=subject_name + "_pred_diameter_mask", dim=dim)
+            save_mask(mask=gt_diameter_mask, output_path=result_root,
+                      op_filename=subject_name + "_gt_diameter_mask", dim=dim)
 
-        # def cal_weight(self, raw_data, shape):
-
-        radius = 4
-        sigmaI = 10
-        sigmaX = 4
-        num_classes = 2
-        patch = torch.ones(15, 1, 32, 32, 32)
-        shape = patch.shape
-        preds = torch.ones(15, num_classes, 32, 32, 32) / num_classes
-        const_padding = torch.nn.ConstantPad3d(radius - 1, 0)
-        padded_preds = const_padding(preds)
-        # According to the weight formula, when Euclidean distance < r,the weight is 0,
-        # so reduce the dissim matrix size to radius-1 to save time and space.
-        print("calculating weights.")
-        dissim = torch.zeros(
-            (shape[0], shape[1], shape[2], shape[3], shape[4], (radius - 1) * 2 + 1, (radius - 1) * 2 + 1,
-             (radius - 1) * 2 + 1))
-        padded_patch = torch.from_numpy(np.pad(patch, (
-            (0, 0), (0, 0), (radius - 1, radius - 1), (radius - 1, radius - 1), (radius - 1, radius - 1)), 'constant'))
-        for x in range(2 * (radius - 1) + 1):
-            for y in range(2 * (radius - 1) + 1):
-                for z in range(2 * (radius - 1) + 1):
-                    dissim[:, :, :, :, :, x, y, z] = patch - padded_patch[:, :, x:shape[2] + x, y:shape[3] + y,
-                                                             z:shape[4] + z]
-
-        temp_dissim = torch.exp(-1 * torch.square(dissim) / sigmaI ** 2)
-        dist = torch.zeros((2 * (radius - 1) + 1, 2 * (radius - 1) + 1, 2 * (radius - 1) + 1))
-        for x in range(1 - radius, radius):
-            for y in range(1 - radius, radius):
-                for z in range(1 - radius, radius):
-                    if x ** 2 + y ** 2 + z ** 2 < radius ** 2:
-                        dist[x + radius - 1, y + radius - 1, z + radius - 1] = np.exp(
-                            -(x ** 2 + y ** 2 + z ** 2) / sigmaX ** 2)
-
-        print("weight calculated.")
-        weight = torch.multiply(temp_dissim, dist)
-        sum_weight = weight.sum(-1).sum(-1).sum(-1)
-
-        # too many values to unpack
-        cropped_seg = []
-        for x in torch.arange((radius - 1) * 2 + 1, dtype=torch.long):
-            width = []
-            for y in torch.arange((radius - 1) * 2 + 1, dtype=torch.long):
-                depth = []
-                for z in torch.arange((radius - 1) * 2 + 1, dtype=torch.long):
-                    depth.append(
-                        padded_preds[:, :, x:x + preds.size()[2], y:y + preds.size()[3], z:z + preds.size()[4]].clone())
-                width.append(torch.stack(depth, 5))
-            cropped_seg.append(torch.stack(width, 5))
-        cropped_seg = torch.stack(cropped_seg, 5)
-        multi1 = cropped_seg.mul(weight)
-        multi2 = multi1.sum(-1).sum(-1).sum(-1).mul(preds)
-        multi3 = sum_weight.mul(preds)
-        assocA = multi2.view(multi2.shape[0], multi2.shape[1], -1).sum(-1)
-        assocV = multi3.view(multi3.shape[0], multi3.shape[1], -1).sum(-1)
-        assoc = assocA.div(assocV).sum(-1)
-        soft_ncut_loss = torch.add(-assoc, num_classes)
+        temp_df = pd.DataFrame.from_dict(dice_df)
+        temp_df.to_csv(os.path.join(result_root, subject_name + "_diameter_df.csv"))

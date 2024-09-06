@@ -1,14 +1,10 @@
 #!/usr/bin/env python
 """
-
+Purpose: Entry point for Unsupervised and Weakly-supervised vessel segmentation with WNet
 """
 
 import argparse
 import random
-
-# import nibabel as nib
-# from glob import glob
-# import os
 import numpy as np
 import torch.utils.data
 from torch.utils.tensorboard import SummaryWriter
@@ -54,9 +50,9 @@ if __name__ == '__main__':
                              "Example: /home/output/")
     parser.add_argument("-training_mode",
                         default="unsupervised",
-                        help="Training Mode: 'unsupervised' or 'supervised'")
+                        help="Training Mode: 'unsupervised' or 'weakly-supervised'")
     parser.add_argument('-train',
-                        default=True,
+                        default=False,
                         help="To train the model")
     parser.add_argument('-test',
                         default=False,
@@ -64,9 +60,18 @@ if __name__ == '__main__':
     parser.add_argument('-predict',
                         default=False,
                         help="To predict a segmentation output of the model and to get a diff between label and output")
+    parser.add_argument('-eval',
+                        default=False,
+                        help="Set this to true for running in production and just for evaluation.")
+    parser.add_argument('-pre_train',
+                        default=False,
+                        help="Set this to true to load pre-trained model.")
     parser.add_argument('-testing_validation',
                         default=False,
                         help="To train the model")
+    parser.add_argument('-create_vessel_diameter_mask',
+                        default=False,
+                        help="To create a vessel diameter mask for input predicted segmentation against GT.")
     parser.add_argument('-predictor_path',
                         default="",
                         help="Path to the input image to predict an output, ex:/home/test/ww25.nii ")
@@ -74,12 +79,28 @@ if __name__ == '__main__':
                         default="",
                         help="Path to the label image to find the diff between label an output"
                              ", ex:/home/test/ww25_label.nii ")
+    parser.add_argument('-seg_path',
+                        default="",
+                        help="Path to the predicted segmentation, ex:/home/test/ww25.nii ")
+    parser.add_argument('-gt_path',
+                        default="",
+                        help="Path to the ground truth segmentation, ex:/home/test/ww25.nii ")
+    parser.add_argument('-dim',
+                        type=int,
+                        default="2",
+                        help="number of dimensions for creating diameter mask. Use 2 for 2D mask and 3 for 3D mask.")
+    parser.add_argument('-save_img',
+                        default=True,
+                        help="Set this to true to save images in the /results folder")
     parser.add_argument('-recr_loss_model_path',
                         default="",
                         help="Path to weights '.pth' file for unet3D model used to compute reconstruction loss")
     parser.add_argument('-load_path',
                         default="",
                         help="Path to checkpoint of existing model to load, ex:/home/model/checkpoint")
+    parser.add_argument('-checkpoint_filename',
+                        default="",
+                        help="Provide filename of the checkpoint if different from 'checkpoint'")
     parser.add_argument('-load_best',
                         default=True,
                         help="Specifiy whether to load the best checkpoiont or the last. "
@@ -143,7 +164,7 @@ if __name__ == '__main__':
                         help="Number of worker threads")
     parser.add_argument("-s_ncut_loss_coeff",
                         type=float,
-                        default=1.0,
+                        default=0.1,
                         help="loss coefficient for soft ncut loss")
     parser.add_argument("-reconstr_loss_coeff",
                         type=float,
@@ -151,7 +172,7 @@ if __name__ == '__main__':
                         help="loss coefficient for reconstruction loss")
     parser.add_argument("-mip_loss_coeff",
                         type=float,
-                        default=0.3,
+                        default=0.1,
                         help="loss coefficient for maximum intensity projection loss")
     parser.add_argument("-mip_axis",
                         type=str,
@@ -176,10 +197,23 @@ if __name__ == '__main__':
                         type=int,
                         default=4,
                         help="SigmaX")
-    parser.add_argument("-init_thresh",
-                        type=int,
+    parser.add_argument("-init_threshold",
+                        type=float,
                         default=3,
                         help="Initial histogram threshold (in %)")
+    parser.add_argument("-otsu_thresh_param",
+                        type=float,
+                        default=0.1,
+                        help="parameter for otsu thresholding. Use 0.1 for unsupervised and 0.5 for weakly-supervised.")
+    parser.add_argument("-area_opening_threshold",
+                        type=int,
+                        default=32,
+                        help="parameter for morphological area-opening. "
+                             "Use 32 for unsupervised and 8 for weakly-supervised.")
+    parser.add_argument("-footprint_radius",
+                        type=int,
+                        default=1,
+                        help="radius of structural footprint for morphological dilation.")
     parser.add_argument("-fold_index",
                         type=str,
                         default="",
@@ -189,8 +223,20 @@ if __name__ == '__main__':
                         default=5,
                         help="number of folds")
     parser.add_argument("-wandb",
-                        default=True,
+                        default=False,
                         help="Set this to true to include wandb logging")
+    parser.add_argument("-wandb_project",
+                        type=str,
+                        default="",
+                        help="Set this to wandb project name e.g., 'DS6_VesselSeg2'")
+    parser.add_argument("-wandb_entity",
+                        type=str,
+                        default="",
+                        help="Set this to wandb project name e.g., 'ds6_vessel_seg2'")
+    parser.add_argument("-wandb_api_key",
+                        type=str,
+                        default="",
+                        help="API Key to login that can be found at https://wandb.ai/authorize")
     parser.add_argument("-train_encoder_only",
                         default=False,
                         help="Set this to true to include wandb logging")
@@ -206,10 +252,6 @@ if __name__ == '__main__':
     parser.add_argument("-use_mtadam",
                         default=False,
                         help="Set this to true to use mTadam optimizer")
-    # parser.add_argument("-create_brain_mask",
-    #                     type=bool,
-    #                     default=False,
-    #                     help="Create binary brain mask for input volumes")
 
     args = parser.parse_args()
 
@@ -219,19 +261,36 @@ if __name__ == '__main__':
 
     LOAD_PATH = args.load_path
     CHECKPOINT_PATH = OUTPUT_PATH + "/" + MODEL_NAME + '/checkpoint/'
-    TENSORBOARD_PATH_TRAINING = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_training/'
-    TENSORBOARD_PATH_VALIDATION = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_validation/'
-    TENSORBOARD_PATH_TESTING = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_testing/'
 
-    LOGGER_PATH = OUTPUT_PATH + "/" + MODEL_NAME + '.log'
+    if str(args.eval).lower() == "true":
+        TENSORBOARD_PATH_TRAINING = None
+        TENSORBOARD_PATH_VALIDATION = None
+        TENSORBOARD_PATH_TESTING = None
+        LOGGER_PATH = None
+        logger = None
+        test_logger = None
+        writer_training = None
+        writer_validating = None
 
-    logger = Logger(MODEL_NAME, LOGGER_PATH).get_logger()
-    test_logger = Logger(MODEL_NAME + '_test', LOGGER_PATH).get_logger()
+    else:
+        TENSORBOARD_PATH_TRAINING = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_training/'
+        TENSORBOARD_PATH_VALIDATION = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_validation/'
+        TENSORBOARD_PATH_TESTING = OUTPUT_PATH + "/" + MODEL_NAME + '/tensorboard/tensorboard_testing/'
+
+        LOGGER_PATH = OUTPUT_PATH + "/" + MODEL_NAME + '.log'
+
+        logger = Logger(MODEL_NAME, LOGGER_PATH).get_logger()
+        test_logger = Logger(MODEL_NAME + '_test', LOGGER_PATH).get_logger()
+
+        writer_training = SummaryWriter(TENSORBOARD_PATH_TRAINING)
+        writer_validating = SummaryWriter(TENSORBOARD_PATH_VALIDATION)
+
     wandb = None
     if str(args.wandb).lower() == "true":
         import wandb
 
-        wandb.init(project="w-net-3d", entity="chethanmysuru", notes=args.model_name)
+        wandb.login(key=args.wandb_api_key)
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, group=args.model_name, notes=args.model_name)
         wandb.config = {
             "learning_rate": args.learning_rate,
             "epochs": args.num_epochs,
@@ -246,28 +305,32 @@ if __name__ == '__main__':
             "sigmaX": args.sigmaX
         }
 
-    # if args.create_brain_mask:
-    #     vols = glob(os.path.join(DATASET_FOLDER, "validate/") + "*.nii") + \
-    #            glob(os.path.join(DATASET_FOLDER, "validate/") + "*.nii.gz")
-    #     for vol in vols:
-    #         filename = os.path.basename(vol).split('.')[0]
-    #         if "_mask" in vol:
-    #             continue
-    #         print("Creating mask for {}".format(filename))
-    #         vol = nib.load(vol)
-    #         affine, vol_data = vol.affine, vol.get_fdata()
-    #         binary_mask = np.where(vol_data > 0, 255, 0).astype(np.uint16)
-    #         binary_mask = nib.Nifti1Image(binary_mask, affine=affine)
-    #         nib.save(binary_mask, os.path.join(DATASET_FOLDER, "validate/") + filename + "_mask.nii.gz")
-    #
-    #     exit()
-
     # models
     model = torch.nn.DataParallel(get_model(model_no=args.model, output_ch=args.num_classes))
     model.cuda()
 
-    writer_training = SummaryWriter(TENSORBOARD_PATH_TRAINING)
-    writer_validating = SummaryWriter(TENSORBOARD_PATH_VALIDATION)
+    # Choose pipeline based on whether or not to perform cross validation
+    # If cross validation is to be performed, please create the dataset folder consisting of
+    # train and train_label folders along with test and test_label folders
+    # (include label folder for weakly-supervised / MIP methods)
+    # e.g.,
+    # /sample_dataset
+    #   /train
+    #   /train_label
+    #   /test
+    #   /test_label
+    # Otherwise prepare the dataset folder consisting of
+    # train, train_label, validate, validate_label, test and test_label folders
+    # (include label folder for weakly-supervised / MIP methods)
+    # e.g.,
+    # /sample_dataset
+    #   /train
+    #   /train_label
+    #   /validate
+    #   /validate_label
+    #   /test
+    #   /test_label
+    # Each folder must contain at least one 3D MRA volume in nifti .nii or nii.gz formats
 
     if str(args.cross_validate).lower() == "true":
         pipeline = CrossValidationPipeline(cmd_args=args, model=model, logger=logger,
@@ -280,37 +343,39 @@ if __name__ == '__main__':
                             writer_training=writer_training, writer_validating=writer_validating, wandb=wandb)
 
     # loading existing checkpoint if supplied
-    if bool(LOAD_PATH):
-        torch.cuda.empty_cache()
-        pipeline.load(checkpoint_path=LOAD_PATH, load_best=args.load_best, fold_index=args.fold_index)
-        torch.cuda.empty_cache()
+    if str(args.pre_train).lower() == "true":
+        pipeline.load(checkpoint_path=LOAD_PATH, load_best=args.load_best, checkpoint_filename=args.checkpoint_filename,
+                      fold_index=args.fold_index)
 
     try:
-
-        if args.train:
+        if str(args.train).lower() == "true":
             pipeline.train()
             torch.cuda.empty_cache()  # to avoid memory errors
 
-        if args.test:
-            if args.load_best:
-                pipeline.load(load_best=True, fold_index=args.fold_index)
+        if str(args.test).lower() == "true":
+            # if args.load_best:
+            #     pipeline.load(load_best=True, fold_index=args.fold_index)
             pipeline.test(test_logger=test_logger)
             torch.cuda.empty_cache()  # to avoid memory errors
 
-        if args.predict:
-            if args.load_best:
-                pipeline.load(load_best=True, fold_index=args.fold_index)
+        if str(args.predict).lower() == "true":
+            # if args.load_best:
+            #     pipeline.load(load_best=True, fold_index=args.fold_index)
             pipeline.predict(predict_logger=test_logger, image_path=args.predictor_path,
                              label_path=args.predictor_label_path, fold_index=args.fold_index)
             # class_preds = torch.load(args.predictor_path)
             # pipeline.extract_segmentation(class_preds)
-        if args.testing_validation:
+        if str(args.testing_validation).lower() == "true":
             pipeline.validate(0, 0)
+            torch.cuda.empty_cache()  # to avoid memory errors
+        if str(args.create_vessel_diameter_mask).lower() == "true":
+            pipeline.create_vessel_diameter_mask(seg_path=args.seg_path, gt_path=args.gt_path, dim=args.dim)
             torch.cuda.empty_cache()  # to avoid memory errors
 
     except Exception as error:
         print(error)
         logger.exception(error)
 
-    writer_training.close()
-    writer_validating.close()
+    if str(args.eval).lower() != "true":
+        writer_training.close()
+        writer_validating.close()
