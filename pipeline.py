@@ -652,6 +652,8 @@ class Pipeline:
 
             class_probs = aggregator1.get_output_tensor()
             class_assignments = aggregator2.get_output_tensor()
+            # torch.save(class_probs, os.path.join(result_root, subjectname + "_class_probs.pth"))
+            # torch.save(class_assignments, os.path.join(result_root, subjectname + "_class_assignments.pth"))
 
             # to avoid memory errors
             torch.cuda.empty_cache()
@@ -671,8 +673,6 @@ class Pipeline:
 
             save_nifti(dilated, os.path.join(result_root, subjectname + ".nii.gz"))
 
-            # torch.save(class_probs, os.path.join(result_root, subjectname + "_class_probs.pth"))
-            # torch.save(class_assignments, os.path.join(result_root, subjectname + "_class_assignments.pth"))
 
             # save_nifti(class_probs.squeeze().numpy().astype(np.float32),
             #            os.path.join(result_root, subjectname + "_seg_vol.nii.gz"))

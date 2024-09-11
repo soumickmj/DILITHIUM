@@ -80,7 +80,8 @@ The following inference hyper-parameters are tuned for the experiments:
 ```code
 -stride_depth 2 -stride_width 2 -stride_length 2 -otsu_thresh_param 0.1 -area_opening_threshold 32 -footprint_radius 1 
 ```
-Set -otsu_thresh_param as 0.1 (for Unsupervised) or 0.5 (for Weakly-supervised). Set -area_opening_threshold as 32 (for Unsupervised) or 8 (for Weakly-supervised).
+Set -otsu_thresh_param as 0.3 (for Weakly-supervised Att. MIP and mMIP methods) or 0.7 (otherwise). Set -area_opening_threshold as 8. 
+*These params can be further tuned.
 
 For a single 3D volume:
 ```code
