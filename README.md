@@ -66,6 +66,21 @@ Dependencies are managed via `pyproject.toml`. Key packages:
  - tensorboard
  - wandb
 
+## Pretrained Models on HuggingFace
+
+The models from this research are publicly available on HuggingFace Hub. You can download the weights and run inference or fine-tune directly using the scripts provided in this repository.
+
+| Model | Training Mode | HuggingFace Link |
+|---|---|---|
+| WNetMSS3D | Unsupervised | [soumickmj/DILITHIUM_UnSup_WNetMSS3D](https://huggingface.co/soumickmj/DILITHIUM_UnSup_WNetMSS3D) |
+| AttWNet3D | Unsupervised | [soumickmj/DILITHIUM_UnSup_AttWNet3D](https://huggingface.co/soumickmj/DILITHIUM_UnSup_AttWNet3D) |
+| WNetMSS3D | Weakly-supervised (multi-MIP) | [soumickmj/DILITHIUM_WeaklySup_WNetMSS3D_mMIP](https://huggingface.co/soumickmj/DILITHIUM_WeaklySup_WNetMSS3D_mMIP) |
+| AttWNet3D | Weakly-supervised (multi-MIP) | [soumickmj/DILITHIUM_WeaklySup_AttWNet3D_mMIP](https://huggingface.co/soumickmj/DILITHIUM_WeaklySup_AttWNet3D_mMIP) |
+| WNetMSS3D | Weakly-supervised (MIP, z-axis) | [soumickmj/DILITHIUM_WeaklySup_WNetMSS3D_MIP](https://huggingface.co/soumickmj/DILITHIUM_WeaklySup_WNetMSS3D_MIP) |
+| AttWNet3D | Weakly-supervised (MIP, z-axis) | [soumickmj/DILITHIUM_WeaklySup_AttWNet3D_MIP](https://huggingface.co/soumickmj/DILITHIUM_WeaklySup_AttWNet3D_MIP) |
+
+Weights are stored as `model.safetensors` and are loaded automatically via the `-hf_model` argument (see below).
+
 ## Run Instructions
 
 The implementation covers a wide range of training, testing and inference code. Please follow the instructions below for each specific method and feature.
@@ -78,6 +93,77 @@ The values for each the generic hyper-parameters specified below is curated for 
 ```
 
 *Use stride diemnsions of 2x2x2 for inference
+
+### Inference from Pretrained Weights (HuggingFace)
+
+The easiest way to run inference is directly from the HuggingFace Hub pretrained weights using the `-hf_model` argument. No manual checkpoint download is needed — weights are fetched automatically.
+
+A ready-to-use script is provided at [`run_inference.sh`](run_inference.sh). Edit the `DATASET_PATH` and `OUTPUT_PATH` variables at the top and run:
+
+```bash
+# Edit DATASET_PATH and OUTPUT_PATH inside the script first, then:
+bash run_inference.sh
+```
+
+The script runs all 6 pretrained models in sequence. To run a single model manually, e.g. the unsupervised AttWNet3D model:
+
+```bash
+uv run python main.py \
+    -model 3 \
+    -model_name "UnSup_AttWNet3D" \
+    -training_mode "unsupervised" \
+    -hf_model "soumickmj/DILITHIUM_UnSup_AttWNet3D" \
+    -dataset_path <path_to_dataset> \
+    -output_path <path_to_output> \
+    -test True \
+    -batch_size 16 -patch_size 32 -num_classes 5 -num_worker 8 \
+    -stride_depth 2 -stride_width 2 -stride_length 2 \
+    -otsu_thresh_param 0.7 -area_opening_threshold 8 -footprint_radius 1
+```
+
+Use `-otsu_thresh_param 0.7` for unsupervised models and `-otsu_thresh_param 0.3` for weakly-supervised models.
+
+### Fine-tuning from Pretrained Weights (HuggingFace)
+
+You can fine-tune any of the pretrained models on a new dataset by combining `-hf_model` (to load HuggingFace weights) with `-train True`. The `-hf_model` argument loads the weights before training begins, so standard training then continues from that initialisation.
+
+Two ready-to-use scripts are provided:
+
+| Script | Starts from |
+|---|---|
+| [`finetune_unsup.sh`](finetune_unsup.sh) | Unsupervised pretrained weights (WNetMSS3D and AttWNet3D) |
+| [`finetune_weaklysup.sh`](finetune_weaklysup.sh) | Weakly-supervised pretrained weights (all 4 variants) |
+
+Edit the `DATASET_PATH` and `OUTPUT_PATH` variables at the top of the relevant script and run:
+
+```bash
+# Unsupervised fine-tuning (train/ and validate/ folders only, no labels needed):
+bash finetune_unsup.sh
+
+# Weakly-supervised fine-tuning (requires train_label/ and validate_label/ too):
+bash finetune_weaklysup.sh
+```
+
+To fine-tune a single model manually, add `-hf_model` alongside the standard training arguments, for example:
+
+```bash
+uv run python main.py \
+    -model 3 \
+    -model_name "Finetune_UnSup_AttWNet3D" \
+    -training_mode "unsupervised" \
+    -hf_model "soumickmj/DILITHIUM_UnSup_AttWNet3D" \
+    -dataset_path <path_to_dataset> \
+    -output_path <path_to_output> \
+    -train True \
+    -batch_size 16 -patch_size 32 -num_classes 5 -num_worker 8 \
+    -learning_rate 0.00005 -num_epochs 20 \
+    -stride_depth 16 -stride_width 28 -stride_length 28 \
+    -s_ncut_loss_coeff 0.1 -reconstr_loss_coeff 1.0 -radius 4
+```
+
+> **Tip:** Use a lower learning rate (e.g. `0.00005`) when fine-tuning from pretrained weights to avoid overwriting learned features.
+
+After fine-tuning, the best checkpoint is saved under `<output_path>/<model_name>/checkpoint/`. To run inference with your fine-tuned model, use `-pre_train True -load_path <path_to_checkpoint>` instead of `-hf_model`.
 
 ### Train Unsupervised WNet
 ```code

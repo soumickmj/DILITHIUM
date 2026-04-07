@@ -23,6 +23,8 @@ dependencies = [
     "Pillow",
     "tensorboard",
     "wandb",
+    "transformers>=4.40.0",
+    "safetensors",
 ]
 
 [tool.uv]

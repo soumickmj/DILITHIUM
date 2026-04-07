@@ -28,3 +28,16 @@ def get_model(model_no, output_ch):  # Send model params from outside
         3: WNet3dAttUNet(output_ch=output_ch),
     }
     return model_list.get(model_no, default_model)
+
+
+def load_model_from_hf(repo_id):
+    """
+    Load a pretrained WNet model from a HuggingFace Hub repository.
+    The repository must use the AutoModel/trust_remote_code pattern
+    (i.e. contain WNets.py, WNetConfigs.py, and model.safetensors).
+    Returns the inner PyTorch model (WNet3dUNet / WNet3dAttUNet / WNet3dUNetMSS)
+    with pretrained weights already loaded.
+    """
+    from transformers import AutoModel
+    hf_model = AutoModel.from_pretrained(repo_id, trust_remote_code=True)
+    return hf_model.model

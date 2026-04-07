@@ -98,6 +98,11 @@ if __name__ == '__main__':
     parser.add_argument('-load_path',
                         default="",
                         help="Path to checkpoint of existing model to load, ex:/home/model/checkpoint")
+    parser.add_argument('-hf_model',
+                        default="",
+                        help="HuggingFace Hub repo ID to load pretrained weights from, "
+                             "e.g. soumickmj/DILITHIUM_UnSup_AttWNet3D. "
+                             "When set, -pre_train and -load_path are ignored.")
     parser.add_argument('-checkpoint_filename',
                         default="",
                         help="Provide filename of the checkpoint if different from 'checkpoint'")
@@ -306,7 +311,11 @@ if __name__ == '__main__':
         }
 
     # models
-    model = torch.nn.DataParallel(get_model(model_no=args.model, output_ch=args.num_classes))
+    if args.hf_model:
+        from utils.model_manager import load_model_from_hf
+        model = torch.nn.DataParallel(load_model_from_hf(args.hf_model))
+    else:
+        model = torch.nn.DataParallel(get_model(model_no=args.model, output_ch=args.num_classes))
     model.cuda()
 
     # Choose pipeline based on whether or not to perform cross validation
@@ -343,7 +352,8 @@ if __name__ == '__main__':
                             writer_training=writer_training, writer_validating=writer_validating, wandb=wandb)
 
     # loading existing checkpoint if supplied
-    if str(args.pre_train).lower() == "true":
+    # Skip if weights were already loaded from HuggingFace Hub
+    if str(args.pre_train).lower() == "true" and not args.hf_model:
         pipeline.load(checkpoint_path=LOAD_PATH, load_best=args.load_best, checkpoint_filename=args.checkpoint_filename,
                       fold_index=args.fold_index)
 
