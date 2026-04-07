@@ -200,7 +200,7 @@ if __name__ == '__main__':
     parser.add_argument("-init_threshold",
                         type=float,
                         default=3,
-                        help="Initial histogram threshold (in %)")
+                        help="Initial histogram threshold (in %%)")
     parser.add_argument("-otsu_thresh_param",
                         type=float,
                         default=0.1,

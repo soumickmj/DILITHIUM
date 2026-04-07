@@ -1,0 +1,29 @@
+[project]
+name = "dilithium"
+version = "1.0.0"
+description = "Deep learning with less-to-no supervision for the segmentation of vessels in high-resolution 7T MRAs using unsupervised and weakly-supervised learning"
+readme = "README.md"
+license = "GPL-3.0-only"
+requires-python = ">=3.8"
+authors = [
+    { name = "Chethan Radhakrishna" },
+    { name = "Soumick Chatterjee" },
+]
+dependencies = [
+    "torch>=1.11.0",
+    "torchvision",
+    "torchio>=0.18",
+    "nibabel>=3.2.2",
+    "numpy>=1.22.3",
+    "pandas>=1.4.1",
+    "scipy>=1.8.0",
+    "scikit-image>=0.19.2",
+    "pytorch-msssim",
+    "matplotlib",
+    "Pillow",
+    "tensorboard",
+    "wandb",
+]
+
+[tool.uv]
+find-links = ["https://download.pytorch.org/whl/cu124"]

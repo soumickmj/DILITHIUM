@@ -3,19 +3,54 @@ DILITHIUM: Deep learning with less-to-no supervision for the segmentation of ves
 
 In this study the Attention WNet proposed in the study ["Upgraded w-net with attention gates and its application in unsupervised 3d liver segmentation"](https://arxiv.org/abs/2011.10654) is adapted for performing 3D patch-based unsupervised vessel segmentation. Additionally, a [UNet MSS](https://link.springer.com/chapter/10.1007/978-3-319-67389-9_32) alternate for the encoder and decoder of the aforementioned WNet is proposed. The MIP-based weak supervision approach is also proposed in this study and the implementation of the proposed methods is presented in this source code.
 
-##Setup Instructions
+## Setup Instructions
 
-All experiments are performed using Tesla V100-SXM2
+### Prerequisites
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
+- A CUDA-capable GPU (experiments were performed on Tesla V100-SXM2 with 32 GB VRAM)
+
+### Environment Setup
+
+1. **Install uv** (if not already installed):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. **Create the virtual environment and install all dependencies:**
+   ```bash
+   uv sync
+   ```
+   This reads `pyproject.toml`, resolves dependencies, creates a `.venv`, and installs everything.
+
+3. **Activate the environment** (optional — `uv run` activates it automatically):
+   ```bash
+   source .venv/bin/activate
+   ```
+
+4. **Run any command inside the environment:**
+   ```bash
+   uv run python main.py --help
+   ```
+
+> **Note:** If you need a specific CUDA version of PyTorch, you can override the index URL:
+> ```bash
+> uv sync --extra-index-url https://download.pytorch.org/whl/cu124
+> ```
+> Adjust `cu124` to match your CUDA version (e.g., `cu118`, `cu121`).
+
+### Hardware & Environment Reference
+
+All experiments were performed using Tesla V100-SXM2
 GPU via NVLink provided by OVGU GPU18 HPC8. The GPU
 node is equipped with a GPU memory of 32GB and a maximum
 of 10 CPU threads with a memory of 6GB per CPU. The cluster
-runs Ubuntu 20.04.3 LTS with CUDA 11.4. The HPC consists
-of 8 such GPU nodes with a limitation of one node per user and
-each GPU process is allowed to run for a maximum period of 6
-days. Therefore, the environment for the experiments is tailored
-to suit the memory and time constraints.
+runs Ubuntu 20.04.3 LTS with CUDA 11.4.
 
 ### Dependencies
+
+Dependencies are managed via `pyproject.toml`. Key packages:
+
  - python ^3.8
  - pytorch ^1.11.0
  - torchio ^0.18
@@ -24,6 +59,12 @@ to suit the memory and time constraints.
  - pandas ^1.4.1
  - scipy ^1.8.0
  - scikit-image ^0.19.2
+ - pytorch-msssim
+ - torchvision
+ - matplotlib
+ - Pillow
+ - tensorboard
+ - wandb
 
 ## Run Instructions
 
