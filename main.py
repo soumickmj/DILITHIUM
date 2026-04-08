@@ -5,6 +5,7 @@ Purpose: Entry point for Unsupervised and Weakly-supervised vessel segmentation 
 
 import argparse
 import random
+import traceback
 import numpy as np
 import torch.utils.data
 from torch.utils.tensorboard import SummaryWriter
@@ -383,8 +384,9 @@ if __name__ == '__main__':
             torch.cuda.empty_cache()  # to avoid memory errors
 
     except Exception as error:
-        print(error)
-        logger.exception(error)
+        traceback.print_exc()
+        if logger is not None:
+            logger.exception(error)
 
     if str(args.eval).lower() != "true":
         writer_training.close()

@@ -1,4 +1,5 @@
 import math
+import pathlib
 import sys
 
 import torch
@@ -11,6 +12,8 @@ from .Resnet2D import ResNet
 from .simpleunet import UNet
 from .VesselSeg_UNet3d_DeepSup import U_Net_DeepSup
 
+_PLOSS_DIR = pathlib.Path(__file__).parent
+
 
 # currently configured for 1 channel only, with datarange as 1 for SSIM
 class PerceptualLoss(torch.nn.Module):
@@ -21,14 +24,14 @@ class PerceptualLoss(torch.nn.Module):
         if loss_model == "resnet2D":  # TODO: not finished
             model = ResNet(in_channels=1, out_channels=1).to(device)
             chk = torch.load(
-                r"./Engineering/pLoss/ResNet14_IXIT2_Base_d1p75_t0_n10_dir01_5depth_L1Loss_best.pth.tar", map_location=device)
+                _PLOSS_DIR / "ResNet14_IXIT2_Base_d1p75_t0_n10_dir01_5depth_L1Loss_best.pth.tar", map_location=device)
             model.load_state_dict(chk['state_dict'])
         elif loss_model == "unet2D":
             model = UNet(in_channels=1, out_channels=1, depth=5, wf=6, padding=True,
                          batch_norm=False, up_mode='upsample', droprate=0.0, is3D=False,
                          returnBlocks=False, downPath=True, upPath=True).to(device)
             chk = torch.load(
-                r"./Engineering/pLoss/SimpleU_IXIT2_Base_d1p75_t0_n10_dir01_5depth_L1Loss_best.pth.tar", map_location=device)
+                _PLOSS_DIR / "SimpleU_IXIT2_Base_d1p75_t0_n10_dir01_5depth_L1Loss_best.pth.tar", map_location=device)
             model.load_state_dict(chk['state_dict'])
             blocks.append(model.down_path[0].block.eval())
             if n_level >= 2:
@@ -54,11 +57,10 @@ class PerceptualLoss(torch.nn.Module):
                 )
         elif loss_model == "unet3Dds":
             model = U_Net_DeepSup().to(device)
-            if model_load_path is None:
-                raise FileNotFoundError
-            chk = torch.load(
-                model_load_path, map_location=device)
-            model.load_state_dict(chk['state_dict'])
+            _unet3dds_path = model_load_path if model_load_path else _PLOSS_DIR / "VesselSeg_UNet3d_DeepSup.pth"
+            chk = torch.load(_unet3dds_path, map_location=device, weights_only=False)
+            state_dict = chk['state_dict'] if isinstance(chk, dict) and 'state_dict' in chk else chk
+            model.load_state_dict(state_dict)
             blocks.append(model.Conv1.conv.eval())
             if n_level >= 2:
                 blocks.append(
@@ -95,7 +97,7 @@ class PerceptualLoss(torch.nn.Module):
             model.fc = nn.Linear(in_features=model.fc.in_features,
                                  out_features=33, bias=False if model.fc.bias is None else True)
             model.to(device)
-            chk = torch.load(r"./Engineering/pLoss/ResNeXt-3-class-best-latest.pth", map_location=device)
+            chk = torch.load(_PLOSS_DIR / "ResNeXt-3-class-best-latest.pth", map_location=device)
             model.load_state_dict(chk)
             blocks.append(
                 nn.Sequential(
@@ -171,7 +173,7 @@ class PerceptualLoss(torch.nn.Module):
             self.loss_func = MS_SSIM(reduction='mean').to(device)
         elif loss_type == "SSIM3D":
             self.loss_func = SSIM(
-                data_range=1, size_average=True, channel=1, spatial_dims=3, win_size=65).to(device)
+                data_range=1, size_average=True, channel=1, spatial_dims=3).to(device)
         elif loss_type == "SSIM2D":
             self.loss_func = SSIM(
                 data_range=1, size_average=True, channel=1, spatial_dims=2).to(device)
@@ -200,4 +202,3 @@ if __name__ == '__main__':
     a = torch.rand(2, 1, 24, 24).cuda()
     b = torch.rand(2, 1, 24, 24).cuda()
     l = x(a, b)
-

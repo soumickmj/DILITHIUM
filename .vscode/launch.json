@@ -1,0 +1,34 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "[1/6] UnSup WNetMSS3D – inference",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-model", "2",
+                "-model_name", "UnSup_WNetMSS3D",
+                "-training_mode", "unsupervised",
+                "-hf_model", "soumickmj/DILITHIUM_UnSup_WNetMSS3D",
+                "-otsu_thresh_param", "0.7",
+                "-batch_size", "16",
+                "-patch_size", "32",
+                "-num_worker", "8",
+                "-stride_depth", "2",
+                "-stride_width", "2",
+                "-stride_length", "2",
+                "-footprint_radius", "1",
+                "-area_opening_threshold", "8",
+                "-num_classes", "5",
+                "-dataset_path", "/run/media/soumick/Enterprise/FranziVSeg/Data/Forrest_Organised/Fold0",
+                "-output_path", "/run/media/soumick/Voyager/Results/DILITHIUM/orig_run0_PULASkiFold0",
+                "-test", "True"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

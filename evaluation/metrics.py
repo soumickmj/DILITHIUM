@@ -14,7 +14,7 @@ import torch.utils.data
 import numpy as np
 import torchio as tio
 # from pytorch_msssim import SSIM
-from .perceptual_loss import PerceptualLoss
+from .pLoss.perceptual_loss import PerceptualLoss
 from scipy.stats import norm
 
 __author__ = "Chethan Radhakrishna and Soumick Chatterjee"

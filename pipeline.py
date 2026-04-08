@@ -15,7 +15,7 @@ import torchio as tio
 # from torchviz import make_dot
 from skimage.filters import threshold_otsu
 from skimage.morphology import area_opening, ball, dilation
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 import sys
 
@@ -308,7 +308,7 @@ class Pipeline:
                 self.optimizer.zero_grad()
 
                 mip_loss = torch.tensor(0.001).float().cuda()
-                with autocast(enabled=self.with_apex):
+                with autocast(device_type="cuda", enabled=self.with_apex):
                     class_preds, feature_rep, reconstructed_patch = self.model(local_batch, ops="both")
                     soft_ncut_loss = self.soft_ncut_loss(local_batch, class_preds)
                     soft_ncut_loss = self.s_ncut_loss_coeff * soft_ncut_loss.mean()
@@ -477,7 +477,7 @@ class Pipeline:
                 local_batch = Pipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
                 try:
                     mip_loss = torch.tensor(0.001).float().cuda()
-                    with autocast(enabled=self.with_apex):
+                    with autocast(device_type="cuda", enabled=self.with_apex):
                         class_preds, feature_rep, reconstructed_patch = self.model(local_batch, ops="both")
                         soft_ncut_loss = self.soft_ncut_loss(local_batch, class_preds)
                         soft_ncut_loss = self.s_ncut_loss_coeff * soft_ncut_loss.mean()
@@ -616,6 +616,7 @@ class Pipeline:
                 }
                 subject = tio.Subject(**sub_dict)
                 subjects.append(subject)
+            test_subjects = subjects
 
         for test_subject in test_subjects:
             # test_subject = test_subjects[0]
@@ -636,7 +637,7 @@ class Pipeline:
                 local_batch = Pipeline.normaliser(patches_batch['img'][tio.DATA].float().cuda())
                 locations = patches_batch[tio.LOCATION]
 
-                with autocast(enabled=self.with_apex):
+                with autocast(device_type="cuda", enabled=self.with_apex):
                     class_preds, feature_rep = self.model(local_batch, ops="enc")
                     feature_rep = torch.sigmoid(feature_rep)
                     # reconstructed_patch = torch.sigmoid(reconstructed_patch)
